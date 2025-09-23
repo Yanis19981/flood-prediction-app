@@ -1,5 +1,6 @@
-streamlit
-pandas
-folium
-streamlit-folium
-branca
+streamlit==1.37.1
+folium==0.17.0
+streamlit-folium==0.21.0
+branca==0.7.2
+pandas==2.2.2
+numpy==1.26.4
