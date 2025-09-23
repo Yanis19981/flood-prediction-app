@@ -30,4 +30,4 @@ if "Latitude" in df.columns and "Longitude" in df.columns:
 
 st_folium(m, width=700, height=500)
 
-    st_folium(m, width=700, height=500)
+
