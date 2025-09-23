@@ -213,3 +213,44 @@ folium.LayerControl(collapsed=False).add_to(m)
 
 st.subheader("Carte (Imagery Hybrid + indicateurs)")
 st_folium(m, height=720, use_container_width=True)
+
+# --- lecture CSV inchangée ---
+df = pd.read_csv(DATA_PATH, encoding="utf-8")
+
+# --- détection + conversion robustes des colonnes lat/lon ---
+def auto_pick(name_candidates, columns):
+    for n in name_candidates:
+        if n in columns: 
+            return n
+    return None
+
+# Si l'utilisateur a choisi une colonne inexistante, on essaie d'en deviner
+lat_guess = auto_pick(
+    ["lat_wgs84","Latitude","latitude","lat","y","Y","Lat"], df.columns
+) if lat_col not in df.columns else lat_col
+lon_guess = auto_pick(
+    ["long_wgs84","Longitude","longitude","lon","x","X","Lon","long"], df.columns
+) if lon_col not in df.columns else lon_col
+
+if lat_guess is None or lon_guess is None:
+    st.error("Aucune colonne de latitude/longitude détectée dans ce CSV. "
+             "Utilise un fichier avec des coordonnées (ex. `lat_wgs84` / `long_wgs84`) "
+             "ou crée un CSV de centroïdes pour les tuiles.")
+    st.stop()
+
+# Conversion tolérante (gère virgules, strings, etc.)
+lat_num = pd.to_numeric(df[lat_guess].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+lon_num = pd.to_numeric(df[lon_guess].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+
+df_valid = df.copy()
+df_valid["_lat"] = lat_num
+df_valid["_lon"] = lon_num
+df_valid = df_valid.dropna(subset=["_lat","_lon"])
+
+if df_valid.empty:
+    st.error("Les colonnes repérées pour la latitude/longitude n'ont pas de valeurs numériques valides. "
+             "Vérifie le CSV ou fournis un CSV de centroïdes.")
+    st.stop()
+
+# Centre de la carte
+center = [df_valid["_lat"].mean(), df_valid["_lon"].mean()]
