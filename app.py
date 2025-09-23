@@ -27,4 +27,17 @@ if "Latitude" in df.columns and "Longitude" in df.columns:
             fill_color="blue"
         ).add_to(m)
 
+
+import folium
+from streamlit_folium import st_folium
+
+m = folium.Map(location=[46.8, -71.2], zoom_start=6)  # Québec
+for _, row in df.iterrows():
+    folium.Marker(
+        location=[row["Latitude"], row["Longitude"]],
+        popup=row.to_dict()
+    ).add_to(m)
+
+st_folium(m, width=700, height=500)
+
     st_folium(m, width=700, height=500)
