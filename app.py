@@ -16,7 +16,7 @@ NUM_CANDIDATES = [
     "No_tuile1", "No_tuile2", "magnitude", "score"
 ]
 
-def norm(s:str) -> str:
+def norm(s: str) -> str:
     return re.sub(r"[^a-z0-9_]", "", s.lower())
 
 def guess_column(df: pd.DataFrame, candidates):
@@ -24,7 +24,6 @@ def guess_column(df: pd.DataFrame, candidates):
     for c in candidates:
         if c in cols:
             return cols[c]
-    # essaie un “contient”
     for k, v in cols.items():
         if any(c in k for c in candidates):
             return v
@@ -43,42 +42,56 @@ left, right = st.columns([0.35, 0.65], gap="large")
 
 with left:
     st.header("Données")
+
+    # Permet l'upload direct (utile sur Streamlit Cloud)
+    uploaded = st.file_uploader("Importer un CSV", type=["csv"])
+
+    # Fallback: lister les CSV du dossier local data/
     csv_files = list_csvs("data")
-    if not csv_files:
-        st.error("Aucun CSV trouvé dans le dossier `data/`. Dépose tes fichiers ici.")
-        st.stop()
 
-    csv_choice = st.selectbox("Choisir un CSV dans `data/`", options=csv_files, index=0)
-    path = os.path.join("data", csv_choice)
-
-    try:
-        df = pd.read_csv(path)
-    except Exception as e:
-        st.error(f"Lecture impossible de `{csv_choice}` : {e}")
-        st.stop()
+    if uploaded is not None:
+        df = pd.read_csv(uploaded)
+        csv_choice = f"(upload) {uploaded.name}"
+    else:
+        if not csv_files:
+            st.error("Aucun CSV trouvé et aucun fichier importé. "
+                     "Uploade un CSV ou ajoute-en un dans le dossier `data/`.")
+            st.stop()
+        csv_choice = st.selectbox("Choisir un CSV dans `data/`", options=csv_files, index=0)
+        path = os.path.join("data", csv_choice)
+        try:
+            df = pd.read_csv(path)
+        except Exception as e:
+            st.error(f"Lecture impossible de `{csv_choice}` : {e}")
+            st.stop()
 
     # Colonnes candidates auto
-    cols_norm = {c: norm(c) for c in df.columns}
     lat_auto = guess_column(df, CANDIDATE_LAT)
     lon_auto = guess_column(df, CANDIDATE_LON)
 
     st.subheader("Colonnes géographiques")
-    lat_col = st.selectbox("Colonne Latitude", options=["<auto>"] + list(df.columns),
-                           index=0 if lat_auto is None else list(df.columns).index(lat_auto) + 1)
-    lon_col = st.selectbox("Colonne Longitude", options=["<auto>"] + list(df.columns),
-                           index=0 if lon_auto is None else list(df.columns).index(lon_auto) + 1)
+    lat_col = st.selectbox(
+        "Colonne Latitude",
+        options=["<auto>"] + list(df.columns),
+        index=0 if lat_auto is None else list(df.columns).index(lat_auto) + 1
+    )
+    lon_col = st.selectbox(
+        "Colonne Longitude",
+        options=["<auto>"] + list(df.columns),
+        index=0 if lon_auto is None else list(df.columns).index(lon_auto) + 1
+    )
     if lat_col == "<auto>":
         lat_col = lat_auto
     if lon_col == "<auto>":
         lon_col = lon_auto
 
     if lat_col is None or lon_col is None:
-        st.warning("Impossible de détecter les colonnes latitude/longitude. Sélectionne-les manuellement.")
+        st.warning("Impossible de détecter les colonnes latitude/longitude. "
+                   "Sélectionne-les manuellement.")
         st.stop()
 
     # Colonne numérique pour couleur/taille
     st.subheader("Indicateur (couleur / taille)")
-    # essaye de proposer une numéraire plausible
     numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     guess_num = None
     for cand in NUM_CANDIDATES:
@@ -89,8 +102,11 @@ with left:
         if guess_num:
             break
 
-    val_col = st.selectbox("Colonne valeur (pour la couleur)", options=["(aucune)"] + numeric_cols,
-                           index=0 if guess_num is None else numeric_cols.index(guess_num) + 1)
+    val_col = st.selectbox(
+        "Colonne valeur (pour la couleur)",
+        options=["(aucune)"] + numeric_cols,
+        index=0 if guess_num is None else numeric_cols.index(guess_num) + 1
+    )
 
     color_mode = st.radio("Mode de coloration", ["Continu", "Classes (seuils)"], horizontal=True)
     point_radius = st.slider("Taille des points (rayon)", 3, 18, 8)
@@ -102,9 +118,12 @@ with left:
 
 with right:
     st.header("Carte")
+
     # Nettoyage / casting
-    df_valid = df[[lat_col, lon_col] + ([val_col] if val_col != "(aucune)" else []) + popup_cols].dropna(subset=[lat_col, lon_col]).copy()
-    # cast robustes
+    keep_cols = [lat_col, lon_col] + ([val_col] if val_col != "(aucune)" else []) + popup_cols
+    keep_cols = list(dict.fromkeys(keep_cols))  # unique, conserve l'ordre
+    df_valid = df[keep_cols].dropna(subset=[lat_col, lon_col]).copy()
+
     for c in [lat_col, lon_col]:
         df_valid[c] = pd.to_numeric(df_valid[c], errors="coerce")
     df_valid = df_valid.dropna(subset=[lat_col, lon_col])
@@ -114,40 +133,48 @@ with right:
         st.stop()
 
     # Centre de la carte
-    center = [df_valid[lat_col].astype(float).mean(), df_valid[lon_col].astype(float).mean()]
+    center = [
+        df_valid[lat_col].astype(float).mean(),
+        df_valid[lon_col].astype(float).mean()
+    ]
 
     # Carte Folium
     m = folium.Map(location=center, zoom_start=6, tiles=None)
 
     # ---- Fond "Imagery Hybrid / Imagerie Hybride" ----
-    # Base : imagerie
+    # Imagerie
     folium.TileLayer(
         tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
         attr='Esri | World Imagery', name='Imagery'
     ).add_to(m)
-    # Labels en overlay (hybride)
+    # Labels (overlay)
     folium.TileLayer(
         tiles='https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
         attr='Esri | Boundaries & Places', name='Labels', overlay=True, control=True
     ).add_to(m)
-    # Optionnel : un fond clair pour comparer
+    # Optionnel : fond clair
     folium.TileLayer('CartoDB positron', name='CartoDB Positron').add_to(m)
 
     # Colormap
+    cmap = None
     if val_col != "(aucune)":
         v = pd.to_numeric(df_valid[val_col], errors="coerce")
         vmin, vmax = np.nanmin(v), np.nanmax(v)
-        if color_mode.startswith("Continu"):
-            cmap = LinearColormap(colors=["#2c7bb6", "#abd9e9", "#ffffbf", "#fdae61", "#d7191c"], vmin=vmin, vmax=vmax)
-            cmap.caption = val_col
-        else:
-            # 5 classes égales
-            bins = np.linspace(vmin, vmax, 6)
-            cmap = StepColormap(colors=["#2c7bb6", "#abd9e9", "#ffffbf", "#fdae61", "#d7191c"], vmin=vmin, vmax=vmax, index=bins)
-            cmap.caption = f"{val_col} (classes)"
-        cmap.add_to(m)
-    else:
-        cmap = None
+        if np.isfinite(vmin) and np.isfinite(vmax) and vmin != vmax:
+            if color_mode.startswith("Continu"):
+                cmap = LinearColormap(
+                    colors=["#2c7bb6", "#abd9e9", "#ffffbf", "#fdae61", "#d7191c"],
+                    vmin=vmin, vmax=vmax
+                )
+                cmap.caption = val_col
+            else:
+                bins = np.linspace(vmin, vmax, 6)
+                cmap = StepColormap(
+                    colors=["#2c7bb6", "#abd9e9", "#ffffbf", "#fdae61", "#d7191c"],
+                    vmin=vmin, vmax=vmax, index=bins
+                )
+                cmap.caption = f"{val_col} (classes)"
+            cmap.add_to(m)
 
     # Cluster
     cluster = MarkerCluster(name="Stations / points", disableClusteringAtZoom=10).add_to(m)
@@ -157,14 +184,17 @@ with right:
         lat, lon = float(r[lat_col]), float(r[lon_col])
 
         # couleur
-        if cmap is not None and pd.notna(r[val_col]):
+        if cmap is not None and (val_col in r) and pd.notna(r[val_col]):
             color = cmap(float(r[val_col]))
         else:
             color = "#3186cc"
 
         # popup HTML
         if popup_cols:
-            rows = "".join(f"<tr><th style='text-align:left;padding-right:6px'>{c}</th><td>{r.get(c)}</td></tr>" for c in popup_cols)
+            rows = "".join(
+                f"<tr><th style='text-align:left;padding-right:6px'>{c}</th><td>{r.get(c)}</td></tr>"
+                for c in popup_cols
+            )
             html = f"<table>{rows}</table>"
         else:
             html = f"({lat:.5f}, {lon:.5f})"
