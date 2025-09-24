@@ -33,9 +33,9 @@ def _coerce_numeric_series(s: pd.Series) -> pd.Series:
 def read_table_auto(path: Path, nrows: int, sep_choice: str, enc_choice: str) -> pd.DataFrame:
     # Excel ?
     if path.suffix.lower() in (".xls", ".xlsx"):
-        return pd.read_excel(path, nrows=nrows)
+        return pd.read_excel(path, nrows=nrows, engine="openpyxl")
 
-    # 1) séparateur
+    # 1) séparateur depuis l'UI (ou auto)
     if sep_choice == "Virgule (,)":
         sep = ","
     elif sep_choice == "Point-virgule (;)":
@@ -45,18 +45,12 @@ def read_table_auto(path: Path, nrows: int, sep_choice: str, enc_choice: str) ->
     elif sep_choice == "Pipe (|)":
         sep = "|"
     else:
-        sep = None
-        try:
-            sample = path.open("rb").read(20000)
-            dialect = csv.Sniffer().sniff(sample.decode("utf-8", "ignore"))
-            sep = dialect.delimiter
-        except Exception:
-            sep = None  # laisser pandas inférer
+        sep = None  # laisser pandas/sniffer essayer
 
-    # 2) encodage
+    # 2) encodages à tester
     encs = [enc_choice] if enc_choice != "Auto" else ["utf-8", "utf-8-sig", "latin1", "cp1252"]
 
-    # 3) essais encodages
+    # 3) première passe : ce que l'utilisateur a demandé
     for enc in encs:
         try:
             return pd.read_csv(
@@ -66,17 +60,39 @@ def read_table_auto(path: Path, nrows: int, sep_choice: str, enc_choice: str) ->
         except Exception:
             continue
 
-    # 4) fallback séparateurs courants
-    for sep_fb in [";", "\t", ",", "|"]:
-        try:
-            return pd.read_csv(
-                path, nrows=nrows, sep=sep_fb, engine="python",
-                on_bad_lines="skip", encoding="latin1", low_memory=False
-            )
-        except Exception:
-            continue
+    # 4) seconde passe : tester séparateurs courants
+    for enc in ["utf-8", "utf-8-sig", "latin1", "cp1252"]:
+        for sep_fb in [";", "\t", ",", "|", None]:
+            try:
+                return pd.read_csv(
+                    path, nrows=nrows, sep=sep_fb, engine="python",
+                    on_bad_lines="skip", encoding=enc, low_memory=False
+                )
+            except Exception:
+                continue
 
-    raise ValueError("Impossible de lire le fichier. Vérifiez séparateur/encodage ou format.")
+    # 5) mode agressif : remplace les caractères illisibles, tente auto-inférence
+    try:
+        return pd.read_csv(
+            path, nrows=nrows, sep=None, engine="python",  # permet d’inférer
+            on_bad_lines="skip", encoding="utf-8", low_memory=False, quoting=3,  # 3 = QUOTE_NONE
+        )
+    except Exception:
+        pass
+
+    # 6) dernier essai : lecture en texte + split heuristique
+    try:
+        txt = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        # devine le séparateur dominant
+        counts = {";": 0, ",": 0, "\t": 0, "|": 0}
+        for line in txt[:200]:
+            for k in counts: counts[k] += line.count(k)
+        guess = max(counts, key=counts.get) if max(counts.values()) > 0 else ","
+        from io import StringIO
+        return pd.read_csv(StringIO("\n".join(txt)), nrows=nrows, sep=guess,
+                           engine="python", on_bad_lines="skip")
+    except Exception as e:
+        raise ValueError("Impossible de lire le fichier. Vérifiez séparateur/encodage ou re-exportez en CSV.") from e
 
 
 def classify_values(s: pd.Series, mode: str, nb: int = 5):
