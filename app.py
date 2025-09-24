@@ -1,265 +1,211 @@
-import streamlit as st
+# app.py
+import os
+import io
 import pandas as pd
 import numpy as np
+import streamlit as st
 import folium
-from folium.plugins import MarkerCluster
+from folium import CircleMarker, TileLayer, LayerControl, FeatureGroup
+from branca.colormap import LinearColormap
 from streamlit_folium import st_folium
-from pathlib import Path
-import csv
 
+# ---------- Réglages page & répertoire data ----------
 st.set_page_config(page_title="Application de prédiction d’inondation – Carte",
                    layout="wide", page_icon="🌊")
+DATA_DIR = "data"
 
-# ------------- PARAMÈTRES DOSSIER -------------
-DATA_DIR = Path(__file__).resolve().parent / "data"
-DATA_DIR.mkdir(exist_ok=True)
+# ---------- Utils ----------
+def sniff_sep(sample: bytes) -> str:
+    text = sample.decode("utf-8", errors="ignore")
+    # ordre le plus courant
+    for s in [",", ";", "\t", "|"]:
+        if s in text:
+            return s
+    return ","  # fallback
 
-# ------------- UTILITAIRES -------------
-@st.cache_data(show_spinner=False)
-def list_csvs(data_dir: Path) -> list[str]:
-    # XLS/XLSX aussi autorisés
-    exts = (".csv", ".CSV", ".xls", ".xlsx", ".XLS", ".XLSX")
-    files = sorted([p.name for p in data_dir.iterdir() if p.suffix in exts])
-    return files
-
-def _coerce_numeric_series(s: pd.Series) -> pd.Series:
-    # gère virgules décimales et espaces fines
-    return pd.to_numeric(
-        s.astype(str).str.replace(",", ".", regex=False).str.replace(" ", "", regex=False),
-        errors="coerce"
-    )
-
-@st.cache_data(show_spinner=False)
-def read_table_auto(path: Path, nrows: int, sep_choice: str, enc_choice: str) -> pd.DataFrame:
-    # Excel ?
-    if path.suffix.lower() in (".xls", ".xlsx"):
-        return pd.read_excel(path, nrows=nrows, engine="openpyxl")
-
-    # 1) séparateur depuis l'UI (ou auto)
-    if sep_choice == "Virgule (,)":
-        sep = ","
-    elif sep_choice == "Point-virgule (;)":
-        sep = ";"
-    elif sep_choice == "Tabulation (\\t)":
-        sep = "\t"
-    elif sep_choice == "Pipe (|)":
-        sep = "|"
+def read_table_auto(file_like, nrows=None, sep_choice="auto", enc_choice="auto"):
+    # lire petit échantillon pour deviner encodage/séparateur
+    raw = file_like.read()
+    if isinstance(raw, str):           # déjà string (cas GitHub raw)
+        raw_bytes = raw.encode("utf-8", errors="ignore")
     else:
-        sep = None  # laisser pandas/sniffer essayer
+        raw_bytes = raw
+    # remettre le curseur
+    bio = io.BytesIO(raw_bytes)
 
-    # 2) encodages à tester
-    encs = [enc_choice] if enc_choice != "Auto" else ["utf-8", "utf-8-sig", "latin1", "cp1252"]
+    sep = sniff_sep(raw_bytes) if sep_choice == "auto" else sep_choice
+    encoding = None if enc_choice == "auto" else enc_choice
 
-    # 3) première passe : ce que l'utilisateur a demandé
-    for enc in encs:
-        try:
-            return pd.read_csv(
-                path, nrows=nrows, sep=sep, engine="python",
-                on_bad_lines="skip", encoding=enc, low_memory=False
-            )
-        except Exception:
-            continue
-
-    # 4) seconde passe : tester séparateurs courants
-    for enc in ["utf-8", "utf-8-sig", "latin1", "cp1252"]:
-        for sep_fb in [";", "\t", ",", "|", None]:
-            try:
-                return pd.read_csv(
-                    path, nrows=nrows, sep=sep_fb, engine="python",
-                    on_bad_lines="skip", encoding=enc, low_memory=False
-                )
-            except Exception:
-                continue
-
-    # 5) mode agressif : remplace les caractères illisibles, tente auto-inférence
+    # 1er essai
     try:
-        return pd.read_csv(
-            path, nrows=nrows, sep=None, engine="python",  # permet d’inférer
-            on_bad_lines="skip", encoding="utf-8", low_memory=False, quoting=3,  # 3 = QUOTE_NONE
-        )
+        df = pd.read_csv(bio, sep=sep, nrows=nrows, encoding=encoding,
+                         engine="python", on_bad_lines="skip", low_memory=False)
+        return df
     except Exception:
-        pass
+        # 2e essai avec latin-1
+        bio.seek(0)
+        df = pd.read_csv(bio, sep=sep, nrows=nrows, encoding="latin-1",
+                         engine="python", on_bad_lines="skip", low_memory=False)
+        return df
 
-    # 6) dernier essai : lecture en texte + split heuristique
-    try:
-        txt = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        # devine le séparateur dominant
-        counts = {";": 0, ",": 0, "\t": 0, "|": 0}
-        for line in txt[:200]:
-            for k in counts: counts[k] += line.count(k)
-        guess = max(counts, key=counts.get) if max(counts.values()) > 0 else ","
-        from io import StringIO
-        return pd.read_csv(StringIO("\n".join(txt)), nrows=nrows, sep=guess,
-                           engine="python", on_bad_lines="skip")
-    except Exception as e:
-        raise ValueError("Impossible de lire le fichier. Vérifiez séparateur/encodage ou re-exportez en CSV.") from e
+def guess_lat_lon_columns(df):
+    lat_candidates = [c for c in df.columns if c.lower() in
+                      ("lat","latitude","lat_wgs84","lat_wgs","y","y_coord","ycoord")]
+    lon_candidates = [c for c in df.columns if c.lower() in
+                      ("lon","long","longitude","long_wgs84","long_wgs","x","x_coord","xcoord")]
+    lat = lat_candidates[0] if lat_candidates else None
+    lon = lon_candidates[0] if lon_candidates else None
+    return lat, lon
 
-
-def classify_values(s: pd.Series, mode: str, nb: int = 5):
-    """Retourne couleurs/valeurs normalisées pour affichage."""
+def normalize_series(s):
     s = pd.to_numeric(s, errors="coerce")
-    v = s.to_numpy(dtype=float)
-    mask = np.isfinite(v)
-    colors = np.array(["#7cb342"] * len(v))  # défaut
-    sizes = np.where(mask, 6 + 14 * (v - np.nanmin(v)) / (np.nanmax(v) - np.nanmin(v) + 1e-9), 6)
+    s = s.replace([np.inf, -np.inf], np.nan)
+    s = s.dropna()
+    if s.empty:
+        return None, None, None
+    vmin, vmax = float(s.min()), float(s.max())
+    return s, vmin, vmax
 
-    if mode == "Continu":
-        # dégradé jaune -> rouge
-        # couleur calculée à partir d'une palette simple
-        # 0 => #f1c40f, 1 => #e74c3c
-        def lerp_color(t):
-            c1 = np.array([241, 196, 15])   # f1c40f
-            c2 = np.array([231, 76, 60])    # e74c3c
-            c = (1 - t) * c1 + t * c2
-            return '#%02x%02x%02x' % tuple(c.astype(int))
+# ---------- Barre latérale : source des données ----------
+st.sidebar.header("Données")
 
-        t = (v - np.nanmin(v)) / (np.nanmax(v) - np.nanmin(v) + 1e-9)
-        t[~mask] = 0.0
-        colors = np.array([lerp_color(x) for x in t])
-        return colors, sizes, None
+source = st.sidebar.radio(
+    "Choisissez la source",
+    ("CSV du dossier data/", "Téléverser un CSV"),
+    horizontal=False,
+)
 
-    # Classes (quantiles)
-    try:
-        q = np.nanquantile(v, np.linspace(0, 1, nb + 1))
-    except Exception:
-        q = np.linspace(np.nanmin(v), np.nanmax(v), nb + 1)
+# Limite de lignes pour garder l’app fluide
+max_rows = st.sidebar.slider("Nombre max. de lignes à charger",
+                             min_value=200, max_value=100000, step=200, value=5000)
 
-    # palette 5 classes
-    pal = ["#66bb6a", "#ffee58", "#ffb74d", "#ff7043", "#e53935"]
-    bins = np.digitize(v, q[1:-1], right=False)
-    colors = np.array([pal[min(b, nb-1)] if m else "#bdbdbd" for b, m in zip(bins, mask)])
-    return colors, sizes, q
+sep_choice = st.sidebar.selectbox("Séparateur", ["auto", ",", ";", "\\t", "|"], index=0)
+enc_choice = st.sidebar.selectbox("Encodage", ["auto", "utf-8", "latin-1"], index=0)
 
+df = None
+csv_name = None
 
-# ------------- SIDEBAR -------------
-with st.sidebar:
-    st.header("Données")
-    csv_files = list_csvs(DATA_DIR)
-    if not csv_files:
-        st.info("Place des fichiers dans le dossier **data/** du dépôt (CSV/XLS/XLSX).")
-        st.stop()
+if source == "CSV du dossier data/":
+    files = [f for f in os.listdir(DATA_DIR) if f.lower().endswith(".csv")]
+    if not files:
+        st.sidebar.warning("Aucun CSV trouvé dans le dossier 'data/'.")
+    else:
+        csv_name = st.sidebar.selectbox("Fichier CSV (data/)", files)
+        with open(os.path.join(DATA_DIR, csv_name), "rb") as f:
+            df = read_table_auto(f, nrows=max_rows, sep_choice=sep_choice, enc_choice=enc_choice)
 
-    csv_name = st.selectbox("Choisissez un CSV (dans data/)", csv_files, index=0)
-    nrows = st.slider("Nombre max. de lignes à charger", 500, 50000, 5000, step=500)
+else:
+    up = st.sidebar.file_uploader("Déposer un CSV", type=["csv"])
+    if up is not None:
+        csv_name = up.name
+        df = read_table_auto(up, nrows=max_rows, sep_choice=sep_choice, enc_choice=enc_choice)
+        st.sidebar.success(f"Fichier chargé : {csv_name} ({len(df):,} lignes)")
 
-    st.subheader("Options d'import")
-    sep_choice = st.selectbox("Séparateur", ["Auto", "Virgule (,)", "Point-virgule (;)", "Tabulation (\\t)", "Pipe (|)"])
-    enc_choice = st.selectbox("Encodage", ["Auto", "utf-8", "utf-8-sig", "latin1", "cp1252"])
-
-# ------------- LECTURE -------------
-df = read_table_auto(DATA_DIR / csv_name, nrows, sep_choice, enc_choice)
-st.caption(f"**{csv_name}** chargé ({len(df)} lignes, {df.shape[1]} colonnes)")
-if len(df) == 0:
-    st.warning("Aucune ligne lisible. Essayez un autre séparateur/encodage.")
+# Stop si pas de données
+if df is None or df.empty:
+    st.title("Application de prédiction d’inondation – Carte")
+    st.info("Sélectionnez ou téléversez un fichier CSV dans la barre latérale pour afficher la carte.")
     st.stop()
 
-# ------------- MAPPING UI -------------
+# ---------- Choix colonnes géographiques ----------
 st.title("Application de prédiction d’inondation – Carte")
-left, right = st.columns([1, 2], gap="large")
 
-with left:
-    st.subheader("Colonnes géographiques")
-    col_names = list(df.columns)
-    lat_col = st.selectbox("Colonne Latitude", ["<auto>"] + col_names)
-    lon_col = st.selectbox("Colonne Longitude", ["<auto>"] + col_names)
+st.subheader("Colonnes géographiques")
+auto_lat, auto_lon = guess_lat_lon_columns(df)
 
-    # Auto-détection simple si <auto>
-    if lat_col == "<auto>":
-        for c in col_names:
-            if c.strip().lower().startswith(("lat_", "latitude", "lat")):
-                lat_col = c; break
-    if lon_col == "<auto>":
-        for c in col_names:
-            if c.strip().lower().startswith(("lon", "lng", "long_", "longitude")):
-                lon_col = c; break
+lat_col = st.selectbox("Colonne Latitude", [auto_lat] + list(df.columns) if auto_lat else list(df.columns),
+                       index=0 if auto_lat else 0, key="latcol")
+lon_col = st.selectbox("Colonne Longitude", [auto_lon] + list(df.columns) if auto_lon else list(df.columns),
+                       index=0 if auto_lon else 0, key="loncol")
 
-    if lat_col not in df.columns or lon_col not in df.columns:
-        st.warning("Sélectionne les colonnes lat/lon.")
-        st.stop()
+# Nettoyage lat/lon
+df["_lat"] = pd.to_numeric(df[lat_col], errors="coerce")
+df["_lon"] = pd.to_numeric(df[lon_col], errors="coerce")
+df_valid = df.dropna(subset=["_lat", "_lon"]).copy()
+if df_valid.empty:
+    st.error("Aucune ligne valide après conversion Latitude/Longitude.")
+    st.stop()
 
-    # Conversion robuste
-    df = df.copy()
-    df[lat_col] = _coerce_numeric_series(df[lat_col])
-    df[lon_col] = _coerce_numeric_series(df[lon_col])
-    df_valid = df[np.isfinite(df[lat_col]) & np.isfinite(df[lon_col])]
-    dropped = len(df) - len(df_valid)
-    if dropped > 0:
-        st.caption(f"{dropped} lignes ignorées (lat/lon invalides).")
+# ---------- Indicateur couleur/taille ----------
+st.subheader("Indicateur (couleur / taille)")
+value_col = st.selectbox("Colonne valeur (pour la couleur/taille)", ["(aucune)"] + list(df_valid.columns))
+color_mode = st.radio("Type de coloration", ["Continu", "Classes (quantiles)"], horizontal=True)
+n_classes = st.slider("Nombre de classes", min_value=3, max_value=9, value=5, disabled=(color_mode!="Classes (quantiles)"))
+base_radius = st.slider("Taille de base des points (rayon)", min_value=2, max_value=20, value=8)
 
-    st.subheader("Indicateur (couleur / taille)")
-    value_cols = ["(aucun)"] + [c for c in col_names if c not in (lat_col, lon_col)]
-    val_col = st.selectbox("Colonne valeur (pour la couleur/taille)", value_cols)
-    mode = st.radio("Type de coloration", ["Continu", "Classes (quantiles)"], horizontal=True)
-    nb_classes = st.slider("Nombre de classes", 3, 7, 5, disabled=(mode != "Classes (quantiles)"))
-    radius_base = st.slider("Taille de base des points (rayon)", 4, 16, 8)
-
-    st.subheader("Popup")
-    popup_cols = st.multiselect("Colonnes à afficher au clic", col_names[:20], default=col_names[:3])
-
-with right:
-    st.subheader("Carte")
-
-    # centre carte
-    if len(df_valid):
-        center = [df_valid[lat_col].astype(float).mean(), df_valid[lon_col].astype(float).mean()]
+# ---------- Préparation style ----------
+use_value = value_col != "(aucune)"
+if use_value:
+    series_raw, vmin, vmax = normalize_series(df_valid[value_col])
+    if series_raw is None:
+        st.warning("La colonne choisie ne contient pas de valeurs numériques utilisables. Les points seront uniformes.")
+        use_value = False
     else:
-        center = [46.8, -71.2]  # Québec (fallback)
+        df_valid["_value"] = pd.to_numeric(df_valid[value_col], errors="coerce")
 
-    # Fond Imagerie Hybride (Esri World Imagery + labels)
-    m = folium.Map(location=center, zoom_start=6, tiles=None, control_scale=True)
-    folium.raster_layers.TileLayer(
-        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        attr="Esri, Maxar, Earthstar Geographics, and the GIS User Community",
-        name="Imagerie (Esri)"
-    ).add_to(m)
-    folium.raster_layers.TileLayer(
-        tiles="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
-        attr="OpenTopoMap (CC-BY-SA)",
-        name="Topographie"
-    ).add_to(m)
-    folium.raster_layers.TileLayer(
-        tiles="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
-        attr="© OpenStreetMap",
-        name="OSM"
-    ).add_to(m)
-    # Labels (stamen-toner-Lite ou Esri labels si dispo)
-    folium.raster_layers.TileLayer(
-        tiles="https://stamen-tiles.a.ssl.fastly.net/toner-lite/{z}/{x}/{y}.png",
-        attr="Stamen Toner Lite",
-        name="Labels"
-    ).add_to(m)
+# ---------- Carte Folium (grand format) ----------
+st.subheader("Carte")
+center = (float(df_valid["_lat"].astype(float).mean()),
+          float(df_valid["_lon"].astype(float).mean()))
 
-    # Couleurs / tailles
-    if val_col != "(aucun)" and val_col in df_valid.columns:
-        colors, sizes, breaks = classify_values(df_valid[val_col], "Continu" if mode == "Continu" else "Classes", nb_classes)
+m = folium.Map(location=center, zoom_start=6, control_scale=True, tiles=None, prefer_canvas=True)
+
+# Fond imagerie hybride (imagerie + labels overlay)
+TileLayer(tiles="https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+          attr="Esri World Imagery", name="Imagerie (Esri)", control=True).add_to(m)
+TileLayer(tiles="https://{s}.basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}.png",
+          attr="© CARTO", name="Labels", control=True, overlay=True, opacity=0.9).add_to(m)
+
+# Quelques fonds en plus
+TileLayer("OpenStreetMap", name="OSM").add_to(m)
+TileLayer("CartoDB positron", name="Topographie").add_to(m)
+
+pts_layer = FeatureGroup(name="Stations / points", show=True).add_to(m)
+
+# Color scale
+if use_value:
+    if color_mode == "Continu":
+        cmap = LinearColormap(colors=["#2c7bb6", "#ffffbf", "#d7191c"], vmin=vmin, vmax=vmax)
+        def color_fn(v):
+            try:
+                return cmap(float(v))
+            except Exception:
+                return "#3388ff"
+        size_fn = lambda v: base_radius + 6 * (0 if vmax==vmin else (float(v)-vmin)/(vmax-vmin))
     else:
-        colors = np.array(["#1976d2"] * len(df_valid))
-        sizes = np.array([radius_base] * len(df_valid))
-        breaks = None
+        cats = pd.qcut(df_valid["_value"], q=n_classes, duplicates="drop")
+        bins = sorted(set(cats.cat.categories.left.tolist() + [cats.cat.categories.right.tolist()[-1]]))
+        cmap = LinearColormap(colors=["#2c7bb6", "#abd9e9", "#ffffbf", "#fdae61", "#d7191c"][:len(bins)-1],
+                              vmin=bins[0], vmax=bins[-1])
+        def color_fn(v):
+            return cmap(float(v))
+        size_fn = lambda v: base_radius + 6 * (0 if (bins[-1]-bins[0]==0) else (float(v)-bins[0])/(bins[-1]-bins[0]))
+else:
+    color_fn = lambda v: "#3388ff"
+    size_fn = lambda v: base_radius
 
-    cluster = MarkerCluster(name="Stations / points", disableClusteringAtZoom=12)
-    cluster.add_to(m)
+# Ajout des points
+for _, r in df_valid.iterrows():
+    lat, lon = float(r["_lat"]), float(r["_lon"])
+    val = r[value_col] if use_value else None
+    color = color_fn(val)
+    radius = float(size_fn(val)) if use_value else base_radius
 
-    for i, row in df_valid.iterrows():
-        lat, lon = float(row[lat_col]), float(row[lon_col])
-        color = colors[df_valid.index.get_loc(i)]
-        r = float(sizes[df_valid.index.get_loc(i)])
+    popup_cols = [c for c in df_valid.columns if not c.startswith("_")]
+    popup_html = "<br>".join([f"<b>{c}</b>: {r[c]}" for c in popup_cols[:20]])
 
-        if popup_cols:
-            items = [f"<b>{c}</b>: {row.get(c, '')}" for c in popup_cols]
-            popup_html = "<br>".join(items)
-        else:
-            popup_html = ""
+    CircleMarker(
+        location=(lat, lon),
+        radius=radius,
+        color=color,
+        fill=True,
+        fill_color=color,
+        fill_opacity=0.85,
+        weight=1,
+        popup=folium.Popup(popup_html, max_width=400)
+    ).add_to(pts_layer)
 
-        folium.CircleMarker(
-            location=[lat, lon],
-            radius=max(3.0, r if val_col != "(aucun)" else radius_base),
-            color=color, fill=True, fill_color=color, fill_opacity=0.75,
-            popup=folium.Popup(popup_html, max_width=400)
-        ).add_to(cluster)
+LayerControl(collapsed=False).add_to(m)
 
-    folium.LayerControl(collapsed=False).add_to(m)
-
-    st_folium(m, height=650, width=None, returned_objects=[])
-
-st.caption("Fond de carte : Esri World Imagery (Imagerie), OpenStreetMap, Stamen.  |  App Streamlit.")
+# 👉 grande carte : height ~ 750px, pleine largeur
+st_folium(m, use_container_width=True, height=750)
