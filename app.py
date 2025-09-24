@@ -1,144 +1,249 @@
 import streamlit as st
 import pandas as pd
-from pathlib import Path
+import numpy as np
 import folium
 from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
-from branca.colormap import linear
+from pathlib import Path
+import csv
 
-st.set_page_config(page_title="Carte satellite + indicateurs", layout="wide")
+st.set_page_config(page_title="Application de prédiction d’inondation – Carte",
+                   layout="wide", page_icon="🌊")
 
-DATA_DIR = Path("data")
-st.title("Application de prédiction d’inondation – Carte")
+# ------------- PARAMÈTRES DOSSIER -------------
+DATA_DIR = Path(__file__).resolve().parent / "data"
+DATA_DIR.mkdir(exist_ok=True)
 
-# --------- Sélection du CSV ----------
-csv_files = sorted([p.name for p in DATA_DIR.glob("*.csv")])
-if not csv_files:
-    st.warning("Aucun fichier CSV trouvé dans le dossier **data/**.")
-    st.stop()
+# ------------- UTILITAIRES -------------
+@st.cache_data(show_spinner=False)
+def list_csvs(data_dir: Path) -> list[str]:
+    # XLS/XLSX aussi autorisés
+    exts = (".csv", ".CSV", ".xls", ".xlsx", ".XLS", ".XLSX")
+    files = sorted([p.name for p in data_dir.iterdir() if p.suffix in exts])
+    return files
 
-with st.sidebar:
-    st.header("Données")
-    csv_name = st.selectbox("Choisissez un CSV (dans data/)", csv_files, index=0)
-    nrows = st.slider("Nombre max. de lignes à charger", 500, 50000, 5000, step=500)
-    st.caption("Augmentez seulement si l’app reste fluide.")
+def _coerce_numeric_series(s: pd.Series) -> pd.Series:
+    # gère virgules décimales et espaces fines
+    return pd.to_numeric(
+        s.astype(str).str.replace(",", ".", regex=False).str.replace(" ", "", regex=False),
+        errors="coerce"
+    )
 
-# --------- Lecture CSV (simple & rapide) ----------
-def read_csv_fast(path: Path, nrows: int) -> pd.DataFrame:
-    for enc in ("utf-8", "utf-8-sig", "latin1"):
+@st.cache_data(show_spinner=False)
+def read_table_auto(path: Path, nrows: int, sep_choice: str, enc_choice: str) -> pd.DataFrame:
+    # Excel ?
+    if path.suffix.lower() in (".xls", ".xlsx"):
+        return pd.read_excel(path, nrows=nrows)
+
+    # 1) séparateur
+    if sep_choice == "Virgule (,)":
+        sep = ","
+    elif sep_choice == "Point-virgule (;)":
+        sep = ";"
+    elif sep_choice == "Tabulation (\\t)":
+        sep = "\t"
+    elif sep_choice == "Pipe (|)":
+        sep = "|"
+    else:
+        sep = None
+        try:
+            sample = path.open("rb").read(20000)
+            dialect = csv.Sniffer().sniff(sample.decode("utf-8", "ignore"))
+            sep = dialect.delimiter
+        except Exception:
+            sep = None  # laisser pandas inférer
+
+    # 2) encodage
+    encs = [enc_choice] if enc_choice != "Auto" else ["utf-8", "utf-8-sig", "latin1", "cp1252"]
+
+    # 3) essais encodages
+    for enc in encs:
         try:
             return pd.read_csv(
-                path, nrows=nrows, low_memory=False,
-                on_bad_lines="skip", encoding=enc, engine="python"
+                path, nrows=nrows, sep=sep, engine="python",
+                on_bad_lines="skip", encoding=enc, low_memory=False
             )
         except Exception:
-            pass
-    # dernier essai, sans encodage explicite
-    return pd.read_csv(path, nrows=nrows, low_memory=False, on_bad_lines="skip", engine="python")
+            continue
 
-df = read_csv_fast(DATA_DIR / csv_name, nrows=nrows)
-st.success(f"CSV chargé : {len(df):,} lignes, {df.shape[1]} colonnes")
-st.dataframe(df.head(10), use_container_width=True)
+    # 4) fallback séparateurs courants
+    for sep_fb in [";", "\t", ",", "|"]:
+        try:
+            return pd.read_csv(
+                path, nrows=nrows, sep=sep_fb, engine="python",
+                on_bad_lines="skip", encoding="latin1", low_memory=False
+            )
+        except Exception:
+            continue
 
-# --------- Choix des colonnes géographiques ----------
-def guess(colnames, candidates):
-    for c in candidates:
-        for name in colnames:
-            if name.lower().strip() == c.lower().strip():
-                return name
-    return None
+    raise ValueError("Impossible de lire le fichier. Vérifiez séparateur/encodage ou format.")
 
-colnames = list(df.columns)
 
-lat_guess = guess(colnames, ["lat", "latitude", "lat_wgs84", "lat_wgs", "Latitude", "LAT"])
-lon_guess = guess(colnames, ["lon", "lng", "longitude", "long_wgs84", "long_wgs", "Longitude", "LON"])
+def classify_values(s: pd.Series, mode: str, nb: int = 5):
+    """Retourne couleurs/valeurs normalisées pour affichage."""
+    s = pd.to_numeric(s, errors="coerce")
+    v = s.to_numpy(dtype=float)
+    mask = np.isfinite(v)
+    colors = np.array(["#7cb342"] * len(v))  # défaut
+    sizes = np.where(mask, 6 + 14 * (v - np.nanmin(v)) / (np.nanmax(v) - np.nanmin(v) + 1e-9), 6)
 
-left, right = st.columns(2)
-with left:
-    lat_col = st.selectbox("Colonne Latitude", colnames, index=colnames.index(lat_guess) if lat_guess in colnames else 0)
-with right:
-    lon_col = st.selectbox("Colonne Longitude", colnames, index=colnames.index(lon_guess) if lon_guess in colnames else 0)
+    if mode == "Continu":
+        # dégradé jaune -> rouge
+        # couleur calculée à partir d'une palette simple
+        # 0 => #f1c40f, 1 => #e74c3c
+        def lerp_color(t):
+            c1 = np.array([241, 196, 15])   # f1c40f
+            c2 = np.array([231, 76, 60])    # e74c3c
+            c = (1 - t) * c1 + t * c2
+            return '#%02x%02x%02x' % tuple(c.astype(int))
 
-# --------- Colonne valeur (pour la couleur) ----------
-num_cols = [c for c in colnames if pd.api.types.is_numeric_dtype(df[c])]
+        t = (v - np.nanmin(v)) / (np.nanmax(v) - np.nanmin(v) + 1e-9)
+        t[~mask] = 0.0
+        colors = np.array([lerp_color(x) for x in t])
+        return colors, sizes, None
 
+    # Classes (quantiles)
+    try:
+        q = np.nanquantile(v, np.linspace(0, 1, nb + 1))
+    except Exception:
+        q = np.linspace(np.nanmin(v), np.nanmax(v), nb + 1)
+
+    # palette 5 classes
+    pal = ["#66bb6a", "#ffee58", "#ffb74d", "#ff7043", "#e53935"]
+    bins = np.digitize(v, q[1:-1], right=False)
+    colors = np.array([pal[min(b, nb-1)] if m else "#bdbdbd" for b, m in zip(bins, mask)])
+    return colors, sizes, q
+
+
+# ------------- SIDEBAR -------------
 with st.sidebar:
-    st.header("Indicateur (couleur / taille)")
-    val_col = st.selectbox("Colonne valeur (optionnel, pour la couleur)", ["(aucune)"] + num_cols, index=0)
-    radius = st.slider("Rayon des points", 3, 14, 6)
+    st.header("Données")
+    csv_files = list_csvs(DATA_DIR)
+    if not csv_files:
+        st.info("Place des fichiers dans le dossier **data/** du dépôt (CSV/XLS/XLSX).")
+        st.stop()
 
-# Nettoyage de base
-df = df.copy()
-df[lat_col] = pd.to_numeric(df[lat_col], errors="coerce")
-df[lon_col] = pd.to_numeric(df[lon_col], errors="coerce")
-df_valid = df.dropna(subset=[lat_col, lon_col])
+    csv_name = st.selectbox("Choisissez un CSV (dans data/)", csv_files, index=0)
+    nrows = st.slider("Nombre max. de lignes à charger", 500, 50000, 5000, step=500)
 
-if val_col != "(aucune)":
-    df_valid[val_col] = pd.to_numeric(df_valid[val_col], errors="coerce")
+    st.subheader("Options d'import")
+    sep_choice = st.selectbox("Séparateur", ["Auto", "Virgule (,)", "Point-virgule (;)", "Tabulation (\\t)", "Pipe (|)"])
+    enc_choice = st.selectbox("Encodage", ["Auto", "utf-8", "utf-8-sig", "latin1", "cp1252"])
 
-if df_valid.empty:
-    st.error("Aucune ligne valide avec latitude/longitude.")
+# ------------- LECTURE -------------
+df = read_table_auto(DATA_DIR / csv_name, nrows, sep_choice, enc_choice)
+st.caption(f"**{csv_name}** chargé ({len(df)} lignes, {df.shape[1]} colonnes)")
+if len(df) == 0:
+    st.warning("Aucune ligne lisible. Essayez un autre séparateur/encodage.")
     st.stop()
 
-# --------- Carte Folium (Imagery + Hybrid) ----------
-center = [df_valid[lat_col].mean(), df_valid[lon_col].mean()]
-m = folium.Map(location=center, zoom_start=6, tiles=None)
+# ------------- MAPPING UI -------------
+st.title("Application de prédiction d’inondation – Carte")
+left, right = st.columns([1, 2], gap="large")
 
-# Fond OSM (au cas où)
-folium.TileLayer(
-    tiles="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
-    attr="© OpenStreetMap", name="OpenStreetMap"
-).add_to(m)
+with left:
+    st.subheader("Colonnes géographiques")
+    col_names = list(df.columns)
+    lat_col = st.selectbox("Colonne Latitude", ["<auto>"] + col_names)
+    lon_col = st.selectbox("Colonne Longitude", ["<auto>"] + col_names)
 
-# Esri World Imagery
-folium.TileLayer(
-    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-    attr="Tiles © Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community",
-    name="Esri World Imagery"
-).add_to(m)
+    # Auto-détection simple si <auto>
+    if lat_col == "<auto>":
+        for c in col_names:
+            if c.strip().lower().startswith(("lat_", "latitude", "lat")):
+                lat_col = c; break
+    if lon_col == "<auto>":
+        for c in col_names:
+            if c.strip().lower().startswith(("lon", "lng", "long_", "longitude")):
+                lon_col = c; break
 
-# Esri Hybrid (labels) – overlay
-folium.TileLayer(
-    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
-    attr="Labels © Esri",
-    name="Hybrid labels", overlay=True, control=True
-).add_to(m)
+    if lat_col not in df.columns or lon_col not in df.columns:
+        st.warning("Sélectionne les colonnes lat/lon.")
+        st.stop()
 
-mc = MarkerCluster(name="Points").add_to(m)
+    # Conversion robuste
+    df = df.copy()
+    df[lat_col] = _coerce_numeric_series(df[lat_col])
+    df[lon_col] = _coerce_numeric_series(df[lon_col])
+    df_valid = df[np.isfinite(df[lat_col]) & np.isfinite(df[lon_col])]
+    dropped = len(df) - len(df_valid)
+    if dropped > 0:
+        st.caption(f"{dropped} lignes ignorées (lat/lon invalides).")
 
-# Palette couleur si valeur choisie
-if val_col != "(aucune)":
-    vmin, vmax = float(df_valid[val_col].min()), float(df_valid[val_col].max())
-    if vmin == vmax:  # éviter une palette dégénérée
-        vmin, vmax = 0.0, vmin or 1.0
-    cmap = linear.OrRd_09.scale(vmin, vmax)
-else:
-    cmap = None
+    st.subheader("Indicateur (couleur / taille)")
+    value_cols = ["(aucun)"] + [c for c in col_names if c not in (lat_col, lon_col)]
+    val_col = st.selectbox("Colonne valeur (pour la couleur/taille)", value_cols)
+    mode = st.radio("Type de coloration", ["Continu", "Classes (quantiles)"], horizontal=True)
+    nb_classes = st.slider("Nombre de classes", 3, 7, 5, disabled=(mode != "Classes (quantiles)"))
+    radius_base = st.slider("Taille de base des points (rayon)", 4, 16, 8)
 
-# popup : on met quelques colonnes informatives si dispo
-popup_cols = [c for c in ["rapport", "nom_mandataire", "version", "date_heure_obs"] if c in df_valid.columns]
+    st.subheader("Popup")
+    popup_cols = st.multiselect("Colonnes à afficher au clic", col_names[:20], default=col_names[:3])
 
-for _, r in df_valid.iterrows():
-    lat, lon = float(r[lat_col]), float(r[lon_col])
-    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-        continue
+with right:
+    st.subheader("Carte")
 
-    color = cmap(r[val_col]) if (cmap is not None and pd.notna(r.get(val_col))) else "#3388ff"
-
-    if popup_cols:
-        html = "<br>".join(f"<b>{c}:</b> {r[c]}" for c in popup_cols)
+    # centre carte
+    if len(df_valid):
+        center = [df_valid[lat_col].astype(float).mean(), df_valid[lon_col].astype(float).mean()]
     else:
-        html = f"{lat_col}: {lat:.5f}<br>{lon_col}: {lon:.5f}"
+        center = [46.8, -71.2]  # Québec (fallback)
 
-    folium.CircleMarker(
-        location=[lat, lon], radius=radius,
-        color=color, fill=True, fill_color=color, fill_opacity=0.85,
-        popup=folium.Popup(html, max_width=400),
-    ).add_to(mc)
+    # Fond Imagerie Hybride (Esri World Imagery + labels)
+    m = folium.Map(location=center, zoom_start=6, tiles=None, control_scale=True)
+    folium.raster_layers.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri, Maxar, Earthstar Geographics, and the GIS User Community",
+        name="Imagerie (Esri)"
+    ).add_to(m)
+    folium.raster_layers.TileLayer(
+        tiles="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+        attr="OpenTopoMap (CC-BY-SA)",
+        name="Topographie"
+    ).add_to(m)
+    folium.raster_layers.TileLayer(
+        tiles="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+        attr="© OpenStreetMap",
+        name="OSM"
+    ).add_to(m)
+    # Labels (stamen-toner-Lite ou Esri labels si dispo)
+    folium.raster_layers.TileLayer(
+        tiles="https://stamen-tiles.a.ssl.fastly.net/toner-lite/{z}/{x}/{y}.png",
+        attr="Stamen Toner Lite",
+        name="Labels"
+    ).add_to(m)
 
-if cmap is not None:
-    cmap.caption = val_col
-    cmap.add_to(m)
+    # Couleurs / tailles
+    if val_col != "(aucun)" and val_col in df_valid.columns:
+        colors, sizes, breaks = classify_values(df_valid[val_col], "Continu" if mode == "Continu" else "Classes", nb_classes)
+    else:
+        colors = np.array(["#1976d2"] * len(df_valid))
+        sizes = np.array([radius_base] * len(df_valid))
+        breaks = None
 
-folium.LayerControl(collapsed=False).add_to(m)
-st_folium(m, width=None, height=720)
+    cluster = MarkerCluster(name="Stations / points", disableClusteringAtZoom=12)
+    cluster.add_to(m)
+
+    for i, row in df_valid.iterrows():
+        lat, lon = float(row[lat_col]), float(row[lon_col])
+        color = colors[df_valid.index.get_loc(i)]
+        r = float(sizes[df_valid.index.get_loc(i)])
+
+        if popup_cols:
+            items = [f"<b>{c}</b>: {row.get(c, '')}" for c in popup_cols]
+            popup_html = "<br>".join(items)
+        else:
+            popup_html = ""
+
+        folium.CircleMarker(
+            location=[lat, lon],
+            radius=max(3.0, r if val_col != "(aucun)" else radius_base),
+            color=color, fill=True, fill_color=color, fill_opacity=0.75,
+            popup=folium.Popup(popup_html, max_width=400)
+        ).add_to(cluster)
+
+    folium.LayerControl(collapsed=False).add_to(m)
+
+    st_folium(m, height=650, width=None, returned_objects=[])
+
+st.caption("Fond de carte : Esri World Imagery (Imagerie), OpenStreetMap, Stamen.  |  App Streamlit.")
