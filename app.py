@@ -1,215 +1,282 @@
-# -*- coding: utf-8 -*-
+# app.py
 import os
 import glob
 import numpy as np
 import pandas as pd
 import streamlit as st
 import folium
-import branca
+from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
 
-# ---------- Réglages généraux Streamlit ----------
-st.set_page_config(page_title="Carte satellite + indicateurs", layout="wide")
+st.set_page_config(page_title="Application de prédiction d’inondation",
+                   layout="wide")
 
-st.title("🛰️ Application de prédiction / visualisation (Imagery Hybrid + indicateurs)")
+st.title("📊 Application de prédiction d’inondation")
 
-DATA_DIR = "data"  # dossier où vous mettez vos CSV
+# -------------------------------
+# 1) Trouver les CSV disponibles
+# -------------------------------
+def list_csvs():
+    in_data = sorted(glob.glob("data/*.csv"))
+    in_root = sorted(glob.glob("*.csv"))
+    # Ne pas dupliquer si même nom
+    seen = set()
+    files = []
+    for p in in_data + in_root:
+        n = os.path.basename(p)
+        if n not in seen:
+            files.append(p)
+            seen.add(n)
+    return files
 
-
-# ---------- Utilitaires ----------
-@st.cache_data(show_spinner=False)
-def load_csv(path: str) -> pd.DataFrame:
-    # encodage robuste pour CSV divers
-    for enc in ("utf-8", "utf-8-sig", "latin1"):
-        try:
-            return pd.read_csv(path, encoding=enc)
-        except Exception:
-            continue
-    # dernier essai par défaut
-    return pd.read_csv(path)
-
-
-def list_csvs(data_dir: str) -> list[str]:
-    return sorted(glob.glob(os.path.join(data_dir, "*.csv")))
-
-
-def make_imagery_hybrid(map_obj: folium.Map):
-    """Ajoute l'imagerie Esri + la couche de labels (hybride)."""
-    # Imagerie (fond)
-    folium.TileLayer(
-        tiles="https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        attr="Esri World Imagery",
-        name="Imagerie",
-        overlay=False,
-        control=True,
-    ).add_to(map_obj)
-
-    # Labels / limites / toponymes (overlay)
-    folium.TileLayer(
-        tiles="https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
-        attr="Esri Reference Layer",
-        name="Labels (hybride)",
-        overlay=True,
-        control=True,
-    ).add_to(map_obj)
-
-
-# ---------- Barre latérale ----------
-st.sidebar.header("Données")
-csv_files = list_csvs(DATA_DIR)
+csv_files = list_csvs()
 if not csv_files:
-    st.sidebar.error("Aucun CSV trouvé dans le dossier `data/`.")
+    st.warning("Aucun CSV trouvé. Place tes fichiers dans `data/` ou à la racine du repo.")
     st.stop()
 
-csv_label_map = {os.path.basename(p): p for p in csv_files}
-csv_name = st.sidebar.selectbox("Choisir un CSV dans `data/`", list(csv_label_map.keys()))
-csv_path = csv_label_map[csv_name]
+# -------------------------------
+# 2) Lecture CSV (cache)
+# -------------------------------
+@st.cache_data(show_spinner=False)
+def load_csv(path):
+    df = pd.read_csv(path, encoding="utf-8")
+    return df
 
-df = load_csv(csv_path)
+left, right = st.columns([0.32, 0.68])
+with left:
+    st.subheader("Données")
+    # On filtre de préférence dans data/
+    only_in_data = [p for p in csv_files if p.startswith("data/")]
+    folder_label = "data/" if only_in_data else "(racine du repo)"
+    st.caption(f"Choisir un CSV dans **{folder_label}**")
+    path = st.selectbox("Fichiers CSV", options=only_in_data or csv_files, index=0,
+                        format_func=lambda p: os.path.basename(p))
+    df = load_csv(path)
+    st.caption(f"{os.path.basename(path)} chargé ({len(df):,} lignes, {len(df.columns)} colonnes)")
 
-st.sidebar.caption(f"**{csv_name}** chargé ({len(df):,} lignes, {len(df.columns)} colonnes)")
-
-# Détection heuristique des colonnes lat/lon
-def guess(colnames, keys):
-    name_lower = {c.lower(): c for c in colnames}
-    for k in keys:
-        if k in name_lower:
-            return name_lower[k]
+# ---------------------------------------------------------
+# 3) Détection/choix des colonnes Latitude / Longitude
+# ---------------------------------------------------------
+def auto_pick(candidates, columns):
+    for c in candidates:
+        if c in columns:
+            return c
     return None
 
-lat_guess = guess(df.columns, ["lat_wgs84", "latitude", "lat", "y"])
-lon_guess = guess(df.columns, ["long_wgs84", "longitude", "lon", "x"])
+# Propositions courantes
+lat_candidates = ["lat_wgs84", "Latitude", "latitude", "lat", "y", "Y", "Lat"]
+lon_candidates = ["long_wgs84", "Longitude", "longitude", "lon", "x", "X", "Lon", "long"]
 
-lat_col = st.sidebar.selectbox("Colonne Latitude", df.columns, index=df.columns.get_loc(lat_guess) if lat_guess in df.columns else 0)
-lon_col = st.sidebar.selectbox("Colonne Longitude", df.columns, index=df.columns.get_loc(lon_guess) if lon_guess in df.columns else 0)
+with left:
+    st.subheader("Colonnes géographiques")
 
-# Colonne valeur pour la couleur
-numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-val_col = st.sidebar.selectbox("Colonne valeur (pour la couleur)", numeric_cols if numeric_cols else df.columns)
+    lat_col = st.selectbox(
+        "Colonne Latitude",
+        options=[c for c in df.columns] + ["<auto>"],
+        index=(df.columns.tolist() + ["<auto>"]).index("<auto>"),
+    )
+    lon_col = st.selectbox(
+        "Colonne Longitude",
+        options=[c for c in df.columns] + ["<auto>"],
+        index=(df.columns.tolist() + ["<auto>"]).index("<auto>"),
+    )
 
-# Paramètres d’indicateur
-st.sidebar.header("Indicateur (couleur / taille)")
-mode_couleur = st.sidebar.radio("Type de coloration", ["Continu", "Classes (seuils)"], horizontal=True)
-min_r, max_r = st.sidebar.slider("Taille des points (rayon)", 4, 20, (5, 12))
-opacity = st.sidebar.slider("Opacité de remplissage", 0.3, 1.0, 0.85)
+# Auto-détection si demandé
+if lat_col == "<auto>":
+    lat_col = auto_pick(lat_candidates, df.columns)
+if lon_col == "<auto>":
+    lon_col = auto_pick(lon_candidates, df.columns)
 
-# Classes (si choisi)
-nb_classes = 5
-seuils = None
-if mode_couleur == "Classes (seuils)":
-    nb_classes = st.sidebar.number_input("Nombre de classes", 3, 9, 5)
-    # coupures automatiques quantiles
-    try:
-        seuils = list(np.unique(np.quantile(df[val_col].dropna().values, np.linspace(0, 1, nb_classes + 1))))
-    except Exception:
-        seuils = None
-
-# Champs affichés au clic
-st.sidebar.header("Info-bulle (popup)")
-popup_cols = st.sidebar.multiselect("Colonnes à afficher", df.columns.tolist(), default=[c for c in df.columns[:4]])
-
-# ---------- Aperçu ----------
-st.subheader("Aperçu des données")
-st.dataframe(df.head(), use_container_width=True)
-
-
-# ---------- Carte ----------
-# Boucle de sécurité : on filtre les lignes valides
-df_valid = df.copy()
-df_valid = df_valid.replace([np.inf, -np.inf], np.nan)
-df_valid = df_valid.dropna(subset=[lat_col, lon_col])
-
-if df_valid.empty:
-    st.warning("Aucune ligne valide avec latitude/longitude.")
+# Vérifs
+if lat_col is None or lon_col is None:
+    with right:
+        st.error(
+            "Aucune colonne de **latitude/longitude** détectée dans ce CSV.\n\n"
+            "- Utilise un fichier avec des coordonnées (ex. `lat_wgs84` / `long_wgs84`)\n"
+            "- OU fournis un CSV de *centroïdes* si ton fichier a seulement des codes de tuiles."
+        )
     st.stop()
 
-# Centre carte sur le centroïde approximatif
-center = [df_valid[lat_col].astype(float).mean(), df_valid[lon_col].astype(float).mean()]
-m = folium.Map(location=center, zoom_start=6, control_scale=True)
+# Conversion tolérante (virgules -> points, strings -> float)
+lat_num = pd.to_numeric(df[lat_col].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+lon_num = pd.to_numeric(df[lon_col].astype(str).str.replace(",", ".", regex=False), errors="coerce")
 
-# Basemap: Imagery Hybrid
-make_imagery_hybrid(m)
-# (optionnel) fond clair alternatif
-folium.TileLayer("CartoDB positron", name="Fond clair").add_to(m)
+df_valid = df.copy()
+df_valid["_lat"] = lat_num
+df_valid["_lon"] = lon_num
+df_valid = df_valid.dropna(subset=["_lat", "_lon"])
 
-# Palette / colormap
-vmin, vmax = float(df_valid[val_col].min()), float(df_valid[val_col].max())
+if df_valid.empty:
+    with right:
+        st.error(
+            f"Les colonnes repérées `{lat_col}` / `{lon_col}` n'ont pas de valeurs numériques valides.\n"
+            "Vérifie ton CSV ou fournis un CSV de centroïdes."
+        )
+    st.stop()
 
-if mode_couleur == "Continu":
-    cmap = branca.colormap.LinearColormap(
-        colors=["#2c7fb8", "#ffff8c", "#d7191c"],  # bleu -> jaune -> rouge
-        vmin=vmin, vmax=vmax
+# ---------------------------------------------------------
+# 4) Colonne de valeur pour couleur / taille (optionnel)
+# ---------------------------------------------------------
+with left:
+    st.subheader("Indicateur (couleur / taille)")
+
+    value_col = st.selectbox(
+        "Colonne valeur (pour la couleur)",
+        options=["(aucune)"] + df.columns.tolist(),
+        index=0
     )
-else:
-    # classes discrètes
-    if not seuils or len(seuils) < 2:
-        seuils = [vmin, *list(np.linspace(vmin, vmax, nb_classes)[1:-1]), vmax]
-    colors = ["#2c7fb8", "#41ab5d", "#ffff8c", "#fdae61", "#d7191c", "#a50026"][: max(2, len(seuils) - 1)]
-    def class_color(v: float):
-        for i in range(len(seuils) - 1):
-            if seuils[i] <= v <= seuils[i + 1]:
-                return colors[i]
-        return colors[-1]
 
-# Ajout des points
-for _, r in df_valid.iterrows():
-    try:
-        lat = float(r[lat_col])
-        lon = float(r[lon_col])
-    except Exception:
-        continue
+    color_mode = st.radio("Type de coloration", ["Continu", "Classes (seuils)"], horizontal=False)
+    point_radius = st.slider("Taille des points (rayon)", 3, 12, 7)
 
-    # valeur pour style
-    try:
-        value = float(r[val_col])
-    except Exception:
-        value = np.nan
+    # Pour le popup
+    st.subheader("Colonnes à afficher dans le popup")
+    popup_cols = st.multiselect(
+        "Choisis 1 à 4 colonnes",
+        options=df.columns.tolist(),
+        default=df.columns[:2].tolist()
+    )
 
-    if mode_couleur == "Continu":
-        color = "#999999" if np.isnan(value) else branca.colormap.linear._to_hex(cmap(value))
-    else:
-        color = "#999999" if np.isnan(value) else class_color(value)
+# Préparer valeur numérique si demandé
+val_series = None
+if value_col != "(aucune)":
+    val_series = pd.to_numeric(df_valid[value_col].astype(str).str.replace(",", ".", regex=False),
+                               errors="coerce")
 
-    # taille proportionnelle
-    if np.isnan(value):
-        radius = min_r
-    else:
-        radius = float(np.interp(value, [vmin, vmax], [min_r, max_r]))
-
-    # popup HTML
-    if popup_cols:
-        html = r[popup_cols].to_frame().to_html(header=False)
-    else:
-        html = r.to_frame().head(12).to_html(header=False)
-
-    folium.CircleMarker(
-        location=[lat, lon],
-        radius=radius,
-        color=color,
-        fill=True,
-        fill_opacity=opacity,
-        weight=1,
-        popup=folium.Popup(folium.IFrame(html=html, width=320, height=200), max_width=340),
+# ---------------------------------------------------------
+# 5) Carte Folium - base “Imagery Hybrid / Imagerie Hybride”
+# ---------------------------------------------------------
+def add_imagery_hybrid(m):
+    """
+    Imagery + calque des noms (hybride Esri).
+    """
+    # Imagerie Esri
+    folium.TileLayer(
+        tiles="https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri, Maxar, GeoEye, Earthstar, CNES/Airbus DS, USDA, USGS, AeroGRID",
+        name="Imagery (Esri)",
+        overlay=False,
+        control=True,
+        max_zoom=19
     ).add_to(m)
 
-# Légende
-if mode_couleur == "Continu":
-    cmap.caption = f"{val_col} (min–max)"
-    cmap.add_to(m)
-else:
-    # légende manuelle discrète
-    legend_html = """
-    <div style="position: fixed; bottom: 30px; left: 30px; z-index: 9999; background: white; padding: 10px 12px; border:1px solid #999; border-radius: 6px;">
-      <b>""" + f"{val_col}" + """</b><br>
+    # Calque des noms/limites (overlay)
+    folium.TileLayer(
+        tiles="https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri",
+        name="Labels (Esri)",
+        overlay=True,
+        control=True,
+        max_zoom=19
+    ).add_to(m)
+
+# Centre carte
+center = [df_valid["_lat"].mean(), df_valid["_lon"].mean()]
+m = folium.Map(location=center, zoom_start=6, control_scale=True, tiles=None)
+add_imagery_hybrid(m)
+folium.LayerControl(position="topleft").add_to(m)
+
+# Cluster
+cluster = MarkerCluster().add_to(m)
+
+# ---------------------------------------------------------
+# 6) Couleurs (continu ou classes)
+# ---------------------------------------------------------
+def make_color_func(vals):
     """
-    for i in range(len(seuils) - 1):
-        legend_html += f'<i style="background:{colors[i]}; width:12px; height:12px; display:inline-block; margin-right:6px;"></i>'
-        legend_html += f"{seuils[i]:.2f} – {seuils[i+1]:.2f}<br>"
-    legend_html += "</div>"
-    folium.map.CustomPane("legend").add_to(m)
-    m.get_root().html.add_child(folium.Element(legend_html))
+    Renvoie une fonction color(value)->hex.
+    - Continu: dégradé du vert (#2ECC71) -> jaune (#F1C40F) -> rouge (#E74C3C)
+    - Classes: 5 classes par défaut (modifiable)
+    """
+    if vals is None:
+        # Pas de valeur -> point bleu
+        return lambda _: "#2E86DE", None
 
-folium.LayerControl(collapsed=False).add_to(m)
+    arr = vals.to_numpy(dtype=float)
+    valid = np.isfinite(arr)
+    if not valid.any():
+        return lambda _: "#2E86DE", None
 
-st.subheader("Carte (Imagery Hybrid + indicateurs)")
-st_folium(m, height=720, use_container_width=True)
+    vmin, vmax = np.nanmin(arr[valid]), np.nanmax(arr[valid])
+    if vmin == vmax:
+        # Valeur constante
+        return lambda _: "#2E86DE", (vmin, vmax)
+
+    if color_mode == "Continu":
+        def _interp_color(v):
+            if v is None or not np.isfinite(v):
+                return "#95A5A6"  # gris
+            t = (v - vmin) / (vmax - vmin)
+            # 0..0.5 : vert->jaune ; 0.5..1 : jaune->rouge
+            if t <= 0.5:
+                # vert(46,204,113) -> jaune(241,196,15)
+                u = t / 0.5
+                r = int(46 + (241 - 46) * u)
+                g = int(204 + (196 - 204) * u)
+                b = int(113 + (15 - 113) * u)
+            else:
+                # jaune(241,196,15) -> rouge(231,76,60)
+                u = (t - 0.5) / 0.5
+                r = int(241 + (231 - 241) * u)
+                g = int(196 + (76 - 196) * u)
+                b = int(15 + (60 - 15) * u)
+            return f"#{r:02X}{g:02X}{b:02X}"
+
+        return _interp_color, (vmin, vmax)
+
+    else:
+        # Classes (5 par défaut)
+        n = 5
+        bins = np.linspace(vmin, vmax, n + 1)
+        palette = ["#2ECC71", "#F1C40F", "#E67E22", "#E74C3C", "#8E44AD"]
+        def _class_color(v):
+            if v is None or not np.isfinite(v):
+                return "#95A5A6"
+            k = np.searchsorted(bins, v, side="right") - 1
+            k = int(np.clip(k, 0, n - 1))
+            return palette[k]
+        return _class_color, bins
+
+color_func, scale = make_color_func(val_series)
+
+# ---------------------------------------------------------
+# 7) Ajout des points (popup + couleur + taille)
+# ---------------------------------------------------------
+def make_popup(row):
+    if not popup_cols:
+        return None
+    parts = []
+    for c in popup_cols[:4]:
+        if c in row:
+            parts.append(f"<b>{c}</b>: {row[c]}")
+    return "<br>".join(parts) if parts else None
+
+for _, row in df_valid.iterrows():
+    lat, lon = float(row["_lat"]), float(row["_lon"])
+    c = color_func(float(row[value_col])) if (value_col != "(aucune)") else "#2E86DE"
+    popup_html = make_popup(row)
+    folium.CircleMarker(
+        location=(lat, lon),
+        radius=point_radius,
+        color=c,
+        fill=True,
+        fill_color=c,
+        fill_opacity=0.85,
+        weight=1,
+        tooltip=None,
+        popup=folium.Popup(popup_html, max_width=350) if popup_html else None
+    ).add_to(cluster)
+
+with right:
+    st.subheader("Carte")
+    st_folium(m, height=720, use_container_width=True)
+
+    # Légende simple
+    if value_col != "(aucune)":
+        if color_mode == "Continu" and scale is not None:
+            st.caption(
+                f"Échelle (continu) — **{value_col}** : min = `{scale[0]:.3g}`, max = `{scale[1]:.3g}`"
+            )
+        elif color_mode == "Classes (seuils)" and scale is not None:
+            edges = ", ".join(f"{v:.3g}" for v in scale)
+            st.caption(f"Classes (seuils) — **{value_col}** : [{edges}]")
