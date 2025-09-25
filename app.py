@@ -296,3 +296,14 @@ folium.LayerControl(collapsed=False).add_to(m)
 
 # affichage
 st_folium(m, width=None, height=720)  # carte plus grande
+
+# --- Téléchargement CSV filtré ---
+st.subheader("Téléchargements")
+csv_bytes = df_valid.to_csv(index=False).encode("utf-8-sig")
+st.download_button(
+    "⬇️ Télécharger le CSV filtré (lat/lon valides)",
+    data=csv_bytes,
+    file_name="donnees_filtrees.csv",
+    mime="text/csv"
+)
+
