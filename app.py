@@ -319,3 +319,30 @@ st.download_button(
     mime="text/html"
 )
 
+
+# --- Export GeoJSON des points ---
+import json
+
+features = []
+for _, r in df_valid.iterrows():
+    try:
+        lat, lon = float(r[lat_col]), float(r[lon_col])
+    except Exception:
+        continue
+    props = {k: (None if pd.isna(r[k]) else r[k]) for k in df_valid.columns if k not in [lat_col, lon_col]}
+    features.append({
+        "type": "Feature",
+        "geometry": {"type": "Point", "coordinates": [lon, lat]},
+        "properties": props
+    })
+
+geojson = {"type": "FeatureCollection", "features": features}
+geojson_bytes = json.dumps(geojson, ensure_ascii=False).encode("utf-8")
+
+st.download_button(
+    "⬇️ Télécharger les points (GeoJSON)",
+    data=geojson_bytes,
+    file_name="points_inondation.geojson",
+    mime="application/geo+json"
+)
+
