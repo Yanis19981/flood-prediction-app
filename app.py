@@ -307,3 +307,15 @@ st.download_button(
     mime="text/csv"
 )
 
+
+# --- Export HTML de la carte Folium ---
+html_str = m.get_root().render()
+html_bytes = html_str.encode("utf-8")
+
+st.download_button(
+    "⬇️ Télécharger la carte (HTML interactif)",
+    data=html_bytes,
+    file_name="carte_inondation.html",
+    mime="text/html"
+)
+
